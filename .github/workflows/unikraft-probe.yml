@@ -51,17 +51,17 @@ jobs:
         id: smoke
         run: |
           set -euo pipefail
+          # 冒烟用官方 nginx：只验证平台链路，与 fanout 无关
           bash ./probe/ukrun.sh --metro "$METRO" \
-            --image "$ORG/fanout-probe:gh-${GITHUB_SHA::7}" \
+            --image nginx:latest \
             -p 443:8080/http+tls \
             -n uk-probe-smoke \
             -o json > smoke.json 2> smoke.err || {
               cat smoke.err; exit 1; }
           cat smoke.json
-          # JSON 输出字段名以实际为准，多字段兜底解析实例 URL
-          URL=$(jq -r '[.dns[]? | select(. // "" | contains(":443"))] | first // empty' smoke.json || true)
-          [ -z "$URL" ] && URL=$(jq -r '.. | strings | select(test("^https?://"))' smoke.json | head -n1 || true)
-          [ -z "$URL" ] && URL=$(jq -r '.service.domains[]?.fqdn // empty' smoke.json | head -n1 | sed 's|^|https://|' || true)
+          # run 的 JSON 输出是实例数组；fqdn 在 service.domains[].fqdn
+          FQDN=$(jq -r '.[0].service.domains[0].fqdn // empty' smoke.json)
+          URL=""; [ -n "$FQDN" ] && URL="https://$FQDN"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           if [ -z "$URL" ]; then
             echo "::error::无法从 run 输出解析实例 URL，原始 JSON 见上"; exit 1
@@ -93,10 +93,9 @@ jobs:
             -o json > probe-run.json 2> probe-run.err || {
               cat probe-run.err; exit 1; }
           cat probe-run.json
-          # 探针启动即完成检测并挂 :8080，等待结果可拉取
-          URL=$(jq -r '[.dns[]? | select(. // "" | contains(":443"))] | first // empty' probe-run.json || true)
-          [ -z "$URL" ] && URL=$(jq -r '.. | strings | select(test("^https?://"))' probe-run.json | head -n1 || true)
-          [ -z "$URL" ] && URL=$(jq -r '.service.domains[]?.fqdn // empty' probe-run.json | head -n1 | sed 's|^|https://|' || true)
+          # run 的 JSON 输出是实例数组；fqdn 在 service.domains[].fqdn
+          FQDN=$(jq -r '.[0].service.domains[0].fqdn // empty' probe-run.json)
+          URL=""; [ -n "$FQDN" ] && URL="https://$FQDN"
           echo "url=$URL" >> "$GITHUB_OUTPUT"
           if [ -z "$URL" ]; then
             echo "::error::无法解析探针实例 URL"; exit 1
@@ -155,8 +154,8 @@ jobs:
           sleep 30
           unikraft instances logs uk-probe-fanout --tail 200 > fanout.log 2>&1 || true
           cat fanout.log
-          URL=$(jq -r '[.dns[]? | select(. // "" | contains(":443"))] | first // empty' fanout-run.json || true)
-          [ -z "$URL" ] && URL=$(jq -r '.. | strings | select(test("^https?://"))' fanout-run.json | head -n1 || true)
+          FQDN=$(jq -r '.[0].service.domains[0].fqdn // empty' fanout-run.json)
+          URL=""; [ -n "$FQDN" ] && URL="https://$FQDN"
           if [ -n "$URL" ]; then
             code=$(curl -sk -o /dev/null -w '%{http_code}' "$URL" || true)
             echo "fanout 管理口 HTTP $code（若 200 说明意外存活）"
