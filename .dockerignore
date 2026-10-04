@@ -1,0 +1,6 @@
+.git
+.github
+probe
+*.log
+Dockerfile
+Kraftfile

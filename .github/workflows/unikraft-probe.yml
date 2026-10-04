@@ -1,0 +1,210 @@
+name: unikraft-probe
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: unikraft-probe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  METRO: ${{ secrets.UKC_METRO }}
+  ORG: ${{ secrets.UKC_ORG }}
+  UKC_DOMAIN: ${{ secrets.UKC_DOMAIN }}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UKC_TOKEN: ${{ secrets.UKC_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 unikraft CLI
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://unikraft.com/cli/install.sh | sh
+          echo "$HOME/.unikraft/bin" >> "$GITHUB_PATH"
+          unikraft version
+
+      - name: 登录 Unikraft Cloud
+        run: |
+          umask 077
+          printf '%s' "$UKC_TOKEN" > "$RUNNER_TEMP/ukc.token"
+          unikraft login --token "$RUNNER_TEMP/ukc.token" --organization "$ORG"
+          rm -f "$RUNNER_TEMP/ukc.token"
+          unikraft login --check
+
+      # ---------- Stage 0：平台冒烟 ----------
+      - name: 预清理残留实例
+        run: |
+          for n in uk-probe-smoke uk-probe-cap uk-probe-fanout; do
+            unikraft instances delete "$n" --force || true
+          done
+
+      - name: Stage 0 - 平台冒烟（官方 nginx）
+        id: smoke
+        run: |
+          set -euo pipefail
+          bash ./probe/ukrun.sh --metro "$METRO" \
+            --image "$ORG/fanout-probe:gh-${GITHUB_SHA::7}" \
+            -p 443:8080/http+tls \
+            -n uk-probe-smoke \
+            -o json > smoke.json 2> smoke.err || {
+              cat smoke.err; exit 1; }
+          cat smoke.json
+          # JSON 输出字段名以实际为准，多字段兜底解析实例 URL
+          URL=$(jq -r '[.dns[]? | select(. // "" | contains(":443"))] | first // empty' smoke.json || true)
+          [ -z "$URL" ] && URL=$(jq -r '.. | strings | select(test("^https?://"))' smoke.json | head -n1 || true)
+          [ -z "$URL" ] && URL=$(jq -r '.service.domains[]?.fqdn // empty' smoke.json | head -n1 | sed 's|^|https://|' || true)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          if [ -z "$URL" ]; then
+            echo "::error::无法从 run 输出解析实例 URL，原始 JSON 见上"; exit 1
+          fi
+          for i in $(seq 1 10); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "$URL" || true)
+            [ "$code" != "000" ] && break
+            sleep 3
+          done
+          echo "HTTP $code from $URL"
+          unikraft instances logs uk-probe-smoke > smoke.log 2>&1 || true
+
+      - name: Stage 0 - 清理冒烟实例
+        if: always() && steps.smoke.outcome != 'skipped'
+        run: unikraft instances delete uk-probe-smoke --force || true
+
+      # ---------- Stage 1：能力探针 ----------
+      - name: Stage 1 - 构建并运行能力探针
+        id: probe
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          unikraft build ./probe --output "$ORG/fanout-probe:gh-${GITHUB_SHA::7}" | tee probe-build.log
+          unikraft run --metro "$METRO" \
+            --image "$ORG/fanout-probe:gh-${GITHUB_SHA::7}" \
+            -p 443:8080/http+tls \
+            -m 256MiB \
+            -n uk-probe-cap \
+            -o json > probe-run.json 2> probe-run.err || {
+              cat probe-run.err; exit 1; }
+          cat probe-run.json
+          # 探针启动即完成检测并挂 :8080，等待结果可拉取
+          URL=$(jq -r '[.dns[]? | select(. // "" | contains(":443"))] | first // empty' probe-run.json || true)
+          [ -z "$URL" ] && URL=$(jq -r '.. | strings | select(test("^https?://"))' probe-run.json | head -n1 || true)
+          [ -z "$URL" ] && URL=$(jq -r '.service.domains[]?.fqdn // empty' probe-run.json | head -n1 | sed 's|^|https://|' || true)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          if [ -z "$URL" ]; then
+            echo "::error::无法解析探针实例 URL"; exit 1
+          fi
+          PROBE_JSON=""
+          for i in $(seq 1 20); do
+            PROBE_JSON=$(curl -sk "$URL/probe" || true)
+            echo "$PROBE_JSON" | jq -e . >/dev/null 2>&1 && break
+            PROBE_JSON=""
+            sleep 3
+          done
+          if [ -n "$PROBE_JSON" ]; then
+            printf '%s' "$PROBE_JSON" > probe-report.json
+            echo "=== 能力探针结果 ==="
+            jq -r '.results[] | "\(.ok)\t\(.name)\t\(.errno // "-")\t\(.detail // "-")"' probe-report.json
+          else
+            echo "::warning::HTTP 通道未取到探针 JSON，回退实例日志"
+          fi
+          unikraft instances logs uk-probe-cap > probe.log 2>&1 || true
+          # 日志兜底：stdout 的 JSON 也在实例日志里
+          if [ ! -s probe-report.json ]; then
+            sed -n '/^{/,/^}/p' probe.log > probe-report.json || true
+          fi
+          jq -e . probe-report.json >/dev/null 2>&1 || {
+            echo "::warning::probe-report.json 无有效 JSON（实例可能未能启动）"; }
+
+      - name: Stage 1 - 清理探针实例
+        if: always() && steps.probe.outcome != 'skipped'
+        run: |
+          unikraft instances delete uk-probe-cap --force || true
+          unikraft images delete "$ORG/fanout-probe:gh-${GITHUB_SHA::7}" --force \
+            || unikraft images delete "$ORG/fanout-probe:gh-${GITHUB_SHA::7}" || true
+
+      # ---------- Stage 2：fanout 本体 ----------
+      - name: Stage 2 - 构建 fanout 本体镜像
+        id: fanout_build
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          unikraft build . --output "$ORG/fanout:gh-${GITHUB_SHA::7}" | tee fanout-build.log
+
+      - name: Stage 2 - 运行 fanout 本体并采集日志
+        id: fanout_run
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          bash ./probe/ukrun.sh --metro "$METRO" \
+            --image "$ORG/fanout:gh-${GITHUB_SHA::7}" \
+            -p 443:8899/http+tls \
+            -m 256MiB \
+            -n uk-probe-fanout \
+            -o json > fanout-run.json 2> fanout-run.err || {
+              cat fanout-run.err; exit 1; }
+          cat fanout-run.json
+          # fanout 预期在启动早期 Fatal；等 30s 让它把 Fatal 打进日志
+          sleep 30
+          unikraft instances logs uk-probe-fanout --tail 200 > fanout.log 2>&1 || true
+          cat fanout.log
+          URL=$(jq -r '[.dns[]? | select(. // "" | contains(":443"))] | first // empty' fanout-run.json || true)
+          [ -z "$URL" ] && URL=$(jq -r '.. | strings | select(test("^https?://"))' fanout-run.json | head -n1 || true)
+          if [ -n "$URL" ]; then
+            code=$(curl -sk -o /dev/null -w '%{http_code}' "$URL" || true)
+            echo "fanout 管理口 HTTP $code（若 200 说明意外存活）"
+            echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stage 2 - 清理 fanout 实例与镜像
+        if: always() && steps.fanout_build.outcome != 'skipped'
+        run: |
+          unikraft instances delete uk-probe-fanout --force || true
+          unikraft images delete "$ORG/fanout:gh-${GITHUB_SHA::7}" --force \
+            || unikraft images delete "$ORG/fanout:gh-${GITHUB_SHA::7}" || true
+
+      # ---------- Stage 3：汇总 ----------
+      - name: Stage 3 - 汇总报告
+        if: always()
+        run: |
+          {
+            echo "## Unikraft Cloud 部署可行性探针报告"
+            echo
+            echo "| 检查 | 结果 | errno | 判定 |"
+            echo "|---|---|---|---|"
+            if jq -e . probe-report.json >/dev/null 2>&1; then
+              jq -r '.results[] | "| \(.name) | \(if .ok then "通过" else "失败" end) | \(.errno // "-") | \(.verdict // "-") |"' probe-report.json
+            else
+              echo "| probe-report 缺失 | - | - | Stage 1 未产出有效 JSON |"
+            fi
+            echo
+            echo "### fanout 本体"
+            echo '```'
+            tail -n 30 fanout.log 2>/dev/null || echo "(无 fanout.log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unikraft-probe-artifacts
+          path: |
+            smoke.json
+            smoke.err
+            smoke.log
+            probe-build.log
+            probe-run.json
+            probe-run.err
+            probe.log
+            probe-report.json
+            fanout-build.log
+            fanout-run.json
+            fanout-run.err
+            fanout.log
+          if-no-files-found: ignore
