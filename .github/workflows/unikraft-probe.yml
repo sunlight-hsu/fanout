@@ -115,9 +115,10 @@ jobs:
           else
             echo "::warning::HTTP 通道未取到探针 JSON，回退实例日志"
           fi
-          # 按 UUID 抓日志（按 name 只查部分 metro，实例可能已停止被漏掉）
+          # 按 UUID+metro 走平台 API 抓日志（instances logs 不接受 metro，会漏实例）
           LOG_TGT="${UUID:-uk-probe-cap}"
-          unikraft instances logs "$LOG_TGT" > probe.log 2>&1 || true
+          unikraft api "/v1/instances/$LOG_TGT/logs" --metro "$METRO" > probe.log 2>&1 || \
+            unikraft instances logs "$LOG_TGT" > probe.log 2>&1 || true
           # 日志兜底：stdout 的 JSON 也在实例日志里
           if [ ! -s probe-report.json ]; then
             sed -n '/^{/,/^}/p' probe.log > probe-report.json || true
@@ -156,7 +157,8 @@ jobs:
           FANOUT_UUID=$(jq -r '.[0].uuid // empty' fanout-run.json)
           # fanout 预期在启动早期 Fatal；等 30s 让它把 Fatal 打进日志
           sleep 30
-          unikraft instances logs "${FANOUT_UUID:-uk-probe-fanout}" --tail 200 > fanout.log 2>&1 || true
+          unikraft api "/v1/instances/$FANOUT_UUID/logs" --metro "$METRO" > fanout.log 2>&1 || \
+            unikraft instances logs "${FANOUT_UUID:-uk-probe-fanout}" > fanout.log 2>&1 || true
           cat fanout.log
           FQDN=$(jq -r '.[0].service.domains[0].fqdn // empty' fanout-run.json)
           URL=""; [ -n "$FQDN" ] && URL="https://$FQDN"
