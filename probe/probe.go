@@ -61,7 +61,7 @@ func main() {
 		add(&rs, "identity.uname", false, "", err, "")
 	} else {
 		add(&rs, "identity.uname", true, fmt.Sprintf("sysname=%s release=%s machine=%s",
-			chars(uts.Sysname), chars(uts.Release), chars(uts.Machine)), nil, "")
+			chars(uts.Sysname[:]), chars(uts.Release[:]), chars(uts.Machine[:])), nil, "")
 	}
 
 	// --- 文件系统：fanout 工作目录 ---
@@ -187,7 +187,7 @@ func main() {
 	}
 }
 
-func chars[T ~int8](a []T) string {
+func chars(a []int8) string {
 	b := make([]byte, 0, len(a))
 	for _, c := range a {
 		if c == 0 {
